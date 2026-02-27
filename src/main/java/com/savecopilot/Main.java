@@ -36,7 +36,9 @@ public class Main {
             System.out.println(" " + ANSI_GREEN + "✓" + ANSI_RESET);
 
             System.out.print(ANSI_CYAN + "⏳ Creazione sessione (caricamento schema DocMind)..." + ANSI_RESET);
-            client.createSession(config.buildSystemPrompt());
+            String cwd = System.getProperty("user.dir");
+            // DocMind è già configurato in ~/.copilot/mcp-config.json - array vuoto
+            client.createSession(cwd, null, config.buildSystemPrompt());
             System.out.println(" " + ANSI_GREEN + "✓" + ANSI_RESET);
 
             System.out.println();

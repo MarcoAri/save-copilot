@@ -80,29 +80,31 @@ public class CopilotAcpClient implements Closeable {
         sendRequest("initialize", params).get(30, TimeUnit.SECONDS);
     }
 
-    /** Create a new agent session with the given system prompt. */
-    public void createSession(String systemPrompt) throws Exception {
+    /**
+     * Create a new agent session and prime it with the system prompt.
+     *
+     * @param cwd          working directory for the session
+     * @param mcpServers   list of MCP server configs (as JSON array string), may be null
+     * @param systemPrompt initial system/context prompt sent as the first message
+     */
+    public void createSession(String cwd, String mcpServers, String systemPrompt) throws Exception {
         JsonObject params = new JsonObject();
+        params.addProperty("cwd", cwd != null ? cwd : System.getProperty("user.dir"));
 
-        JsonArray messages = new JsonArray();
-        JsonObject sysMsg = new JsonObject();
-        sysMsg.addProperty("role", "system");
-        JsonArray content = new JsonArray();
-        JsonObject textPart = new JsonObject();
-        textPart.addProperty("type", "text");
-        textPart.addProperty("text", systemPrompt);
-        content.add(textPart);
-        sysMsg.add("content", content);
-        messages.add(sysMsg);
+        JsonArray servers = new JsonArray();
+        if (mcpServers != null && !mcpServers.isBlank()) {
+            servers = GSON.fromJson(mcpServers, JsonArray.class);
+        }
+        params.add("mcpServers", servers);
 
-        params.add("messages", messages);
-        params.addProperty("mode", "agent");
-
-        JsonObject result = sendRequest("session.create", params).get(30, TimeUnit.SECONDS);
+        JsonObject result = sendRequest("session/new", params).get(30, TimeUnit.SECONDS);
         if (result != null && result.has("sessionId")) {
             this.sessionId = result.get("sessionId").getAsString();
-        } else if (result != null && result.has("id")) {
-            this.sessionId = result.get("id").getAsString();
+        }
+
+        // Prime the session with the system prompt so the agent loads DocMind context
+        if (systemPrompt != null && !systemPrompt.isBlank()) {
+            sendMessage(systemPrompt, null);
         }
     }
 
@@ -130,21 +132,15 @@ public class CopilotAcpClient implements Closeable {
         JsonObject params = new JsonObject();
         params.addProperty("sessionId", sessionId);
 
-        JsonArray messages = new JsonArray();
-        JsonObject userMsg = new JsonObject();
-        userMsg.addProperty("role", "user");
-        JsonArray content = new JsonArray();
+        JsonArray promptArray = new JsonArray();
         JsonObject textPart = new JsonObject();
         textPart.addProperty("type", "text");
         textPart.addProperty("text", userText);
-        content.add(textPart);
-        userMsg.add("content", content);
-        messages.add(userMsg);
+        promptArray.add(textPart);
+        params.add("prompt", promptArray);
 
-        params.add("messages", messages);
-
-        // session.send streams events; we also wait for the RPC response
-        CompletableFuture<JsonObject> future = sendRequest("session.send", params);
+        // session/prompt streams session/update notifications and then returns a result
+        CompletableFuture<JsonObject> future = sendRequest("session/prompt", params);
 
         // Wait for either: RPC response or a timeout
         future.get(120, TimeUnit.SECONDS);
@@ -222,51 +218,27 @@ public class CopilotAcpClient implements Closeable {
         JsonObject params = paramsEl.getAsJsonObject();
 
         switch (method) {
-            case "session.event" -> handleSessionEvent(params);
+            case "session/update" -> handleSessionUpdate(params);
             default -> { /* ignore other notifications */ }
         }
     }
 
-    private void handleSessionEvent(JsonObject params) {
-        // Events carry a "type" field describing what happened
-        if (!params.has("type")) return;
-        String type = params.get("type").getAsString();
+    private void handleSessionUpdate(JsonObject params) {
+        // Protocol: params = {sessionId, update: {sessionUpdate:"agent_message_chunk", content:{type,text}}}
+        if (!params.has("update")) return;
+        JsonObject update = params.getAsJsonObject("update");
+
+        String updateType = update.has("sessionUpdate") ? update.get("sessionUpdate").getAsString() : "";
+        if (!"agent_message_chunk".equals(updateType)) return;
 
         Consumer<String> consumer = this.chunkConsumer;
         if (consumer == null) return;
 
-        switch (type) {
-            case "assistant.message_delta" -> {
-                // Streaming text delta
-                if (params.has("delta")) {
-                    JsonObject delta = params.getAsJsonObject("delta");
-                    if (delta.has("text")) {
-                        consumer.accept(delta.get("text").getAsString());
-                    }
-                }
+        if (update.has("content")) {
+            JsonObject content = update.getAsJsonObject("content");
+            if (content.has("text")) {
+                consumer.accept(content.get("text").getAsString());
             }
-            case "assistant.message" -> {
-                // Full message (non-streaming fallback)
-                if (params.has("message")) {
-                    JsonObject message = params.getAsJsonObject("message");
-                    if (message.has("content")) {
-                        JsonElement content = message.get("content");
-                        if (content.isJsonPrimitive()) {
-                            consumer.accept(content.getAsString());
-                        } else if (content.isJsonArray()) {
-                            for (JsonElement el : content.getAsJsonArray()) {
-                                if (el.isJsonObject()) {
-                                    JsonObject part = el.getAsJsonObject();
-                                    if (part.has("text")) {
-                                        consumer.accept(part.get("text").getAsString());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            default -> { /* ignore other event types */ }
         }
     }
 
